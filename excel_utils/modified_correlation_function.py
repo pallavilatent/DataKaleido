@@ -1,0 +1,456 @@
+# This file contains code that automatically calculates the correlation values appropriately for the columns in the dataset. Here, we are using 5 types of correlation methods namely, Perason, Spearman, Point bi-serial, Correlation ratio and Cramer's V.
+ 
+import pandas as pd
+import numpy as np
+import os
+from scipy.stats import spearmanr, pearsonr, chi2_contingency, pointbiserialr
+from itertools import combinations
+import matplotlib.pyplot as plt
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+import seaborn as sns
+import matplotlib.pyplot as plt
+import streamlit as st
+
+# Utility for Cramér’s V
+def cramers_v(confusion_matrix):
+    try:
+        chi2 = chi2_contingency(confusion_matrix)[0]
+        n = confusion_matrix.sum().sum()
+        k = min(confusion_matrix.shape) - 1
+        return np.sqrt((chi2 / n) / k) if k != 0 else np.nan
+    except (ValueError, IndexError):
+        return np.nan
+
+def correlation_ratio(categories, measurements):
+    try:
+        fcat, _ = pd.factorize(categories)
+        cat_num = np.max(fcat) + 1
+        y_avg_array = np.zeros(cat_num)
+        n_array = np.zeros(cat_num)
+        for i in range(cat_num):
+            cat_measures = measurements[fcat == i]
+            n_array[i] = len(cat_measures)
+            y_avg_array[i] = np.mean(cat_measures) if len(cat_measures) > 0 else 0
+        y_total_avg = np.sum(y_avg_array * n_array) / np.sum(n_array)
+        numerator = np.sum(n_array * (y_avg_array - y_total_avg) ** 2)
+        denominator = np.sum((measurements - y_total_avg) ** 2)
+        return np.sqrt(numerator / denominator) if denominator != 0 else 0
+    except Exception as e:
+        st.write(f"Error calculating correlation ratio: {e}")
+        return np.nan
+
+def phi_coefficient(x, y):
+    try:
+        confusion_matrix = pd.crosstab(x, y)
+        if confusion_matrix.shape != (2, 2):
+            return np.nan  # Not applicable if not 2x2
+        chi2 = chi2_contingency(confusion_matrix)[0]
+        n = confusion_matrix.sum().sum()
+        phi = np.sqrt(chi2 / n)
+        return phi
+    except Exception as e:
+        st.write(f"Error calculating phi coefficient: {e}")
+        return np.nan
+
+def interpret_correlation_value(value, method_name, threshold):
+    #Provides a textual interpretation for a given correlation value based on its method.
+    #default_threshold = 0.7
+    #threshold = default_threshold
+    
+    if pd.isna(value):
+        return f"{method_name} correlation: NaN - Not applicable or could not be calculated."
+
+    if method_name in ["Pearson", "Spearman", "Point-Biserial", "Phi", "Cramér's V", "Correlation Ratio (η)"]:
+        abs_value = abs(value)
+        
+        if abs_value >= threshold:
+            return "Strong correlation"
+        elif abs_value >= threshold - 0.2:
+            return "Moderate correlation"
+        elif abs_value > 0:
+            return "Weak correlation"
+        else: # abs_value == 0
+            return "No correlation"
+    else:
+        return f"Interpretation not available for this method"
+
+# Mapping for scale types
+continuous_scales = ['Continuous', 'Interval (Continuous)', 'Numerical', 'Percentage', 'Ratio'] 
+ordinal_scales = ['Ordinal (Categorical)']
+categorical_scales = ['Nominal (Categorical - Few Classes)', 'Nominal (Categorical - MultiClass)']
+binary_scales = ['Binary (Numeric)', 'Binary (Boolean)', 'Binary (Categorical)']
+skip_scales = ['Text (Free Text)', 'Unknown', 'Datetime (Interval)', 'Geography']
+
+# Main correlation pipeline
+def compute_auto_correlations_v2(df, metadata_df, output_folder='output'):
+    os.makedirs(output_folder, exist_ok=True)
+    tidy_results = []
+    interpretation_messages = []
+    default_threshold = 0.7
+
+       # Identify relevant columns based on metadata
+    relevant_cols = metadata_df[~metadata_df['Scale of Measurement'].isin(skip_scales)]['Column'].tolist()
+
+    # Create the symmetric matrix once before the loop
+    symmetric_matrix = pd.DataFrame(index=relevant_cols, columns=relevant_cols, dtype=float)
+
+    # --- Correlation Method Selection Map ---
+    corr_methods = {
+        ('continuous', 'continuous'): 'Pearson',
+        ('ordinal', 'ordinal'): 'Spearman',
+        ('ordinal', 'continuous'): 'Spearman',
+        ('continuous', 'ordinal'): 'Spearman',
+        ('categorical', 'categorical'): 'Cramér\'s V',
+        ('categorical', 'binary'): 'Cramér\'s V',
+        ('binary', 'categorical'): 'Cramér\'s V',
+        #('binary', 'binary'): 'Phi Coefficient', # Using Phi for binary-binary as it's more specific
+        ('continuous', 'binary'): 'Point-Biserial',
+        ('binary', 'continuous'): 'Point-Biserial',
+        ('continuous', 'categorical'): 'Correlation Ratio (η)',
+        ('categorical', 'continuous'): 'Correlation Ratio (η)',
+    }
+    # Initialize session state for correlation threshold management
+    if 'correlation_threshold_state' not in st.session_state:
+        st.session_state.correlation_threshold_state = {
+            'current_step': 'threshold_choice',
+            'threshold_set': False,
+            'user_threshold': default_threshold,
+            'columns_to_drop': [],
+            'processed_correlations': False
+        }
+    
+    # Always compute correlations first, regardless of UI state
+    st.markdown("### 🔗 Computing Correlations...")
+    
+    # Generate all pairs of columns to be correlated
+    for col1, col2 in combinations(relevant_cols, 2):
+        scale1 = metadata_df.loc[metadata_df['Column'] == col1, 'Scale of Measurement'].values[0]
+        scale2 = metadata_df.loc[metadata_df['Column'] == col2, 'Scale of Measurement'].values[0]
+        
+        # Get simplified scale names for method selection
+        def get_group(scale):
+            if scale in continuous_scales: return 'continuous'
+            if scale in ordinal_scales: return 'ordinal'
+            if scale in categorical_scales: return 'categorical'
+            if scale in binary_scales: return 'binary'
+            return 'skip'
+        
+        group1, group2 = get_group(scale1), get_group(scale2)
+        
+        method = corr_methods.get(tuple(sorted((group1, group2))), 'Skipped')
+        val = np.nan
+        
+        try:
+            if method != 'Skipped':
+                aligned = df[[col1, col2]].dropna()
+                
+                if aligned.empty:
+                    val = np.nan
+                elif method == 'Pearson':
+                    val, _ = pearsonr(aligned[col1], aligned[col2])
+                elif method == 'Spearman':
+                    val, _ = spearmanr(aligned[col1], aligned[col2])
+                elif method == 'Cramér\'s V':
+                    confusion_matrix = pd.crosstab(aligned[col1], aligned[col2])
+                    val = cramers_v(confusion_matrix)
+                elif method == 'Point-Biserial':
+                    continuous_col = col1 if group1 == 'continuous' else col2
+                    binary_col = col2 if continuous_col == col1 else col1
+                    try:
+                        binary_series = aligned[binary_col].dropna()
+                        if not binary_series.empty:
+                            unique_values = binary_series.unique()
+                            unique_values_str = [str(val) for val in unique_values]
+                            safe_categorical = pd.Categorical(binary_series, categories=unique_values_str)
+                            val, _ = pointbiserialr(aligned[continuous_col], safe_categorical.codes)
+                        else:
+                            val = np.nan
+                    except Exception as e:
+                        st.warning(f"Warning: Could not process Point-Biserial correlation for columns {col1} vs {col2}: {str(e)}")
+                        val = np.nan
+                elif method == 'Correlation Ratio (η)':
+                    cont_col = col1 if group1 == 'continuous' else col2
+                    cat_col = col2 if cont_col == col1 else col1
+                    val = correlation_ratio(aligned[cat_col], aligned[cont_col])
+        except Exception as e:
+            method = 'Error'
+            val = np.nan
+            print(f"Error processing {col1} vs {col2} with method {method}: {e}")
+
+        # Add interpretation and results
+        interpretation_str = interpret_correlation_value(round(val, 3), method, st.session_state.correlation_threshold_state['user_threshold'])
+        tidy_results.append({
+            'Column_1': col1,
+            'Column_2': col2,
+            'Method': method,
+            'Correlation': round(val, 3) if pd.notna(val) else val,
+            'Interpretation': interpretation_str
+        })
+        
+        # Populate symmetric matrix
+        symmetric_matrix.loc[col1, col2] = round(val, 2)
+        symmetric_matrix.loc[col2, col1] = round(val, 2)
+        
+        # Add interpretation message for strong correlations
+        if interpretation_str == 'Strong correlation':
+            print(f"Strong correlation found between '{col1}' and '{col2}' using {method}.")
+    
+    # --- Finalize matrices and summary tables ---
+    np.fill_diagonal(symmetric_matrix.values, 1)
+    
+    # Drop rows/columns that have no valid correlations
+    symmetric_matrix.dropna(axis=0, how='all', inplace=True)
+    symmetric_matrix.dropna(axis=1, how='all', inplace=True)
+    
+    # Create initial tidy_df and store in session state
+    if tidy_results:
+        tidy_df = pd.DataFrame(tidy_results).sort_values(by="Correlation", ascending=False)
+        st.session_state.correlation_threshold_state['tidy_df'] = tidy_df
+        st.success(f"✅ Computed {len(tidy_results)} correlation pairs")
+    else:
+        st.warning("⚠️ No correlations could be computed. Check your data and metadata.")
+        return None, None, None, df, interpretation_messages, metadata_df
+    
+    # Step-by-step correlation threshold workflow
+    if not st.session_state.correlation_threshold_state['processed_correlations']:
+        st.markdown("### 🔗 Correlation Analysis Configuration")
+        
+        # Step 1: Threshold choice
+        if st.session_state.correlation_threshold_state['current_step'] == 'threshold_choice':
+            st.subheader("Step 1: Set Correlation Threshold")
+            st.info(f"**Current threshold:** {default_threshold}")
+            st.write("Choose whether to set a custom threshold for filtering correlation results:")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("✅ Use Default Threshold", key="use_default_threshold"):
+                    st.session_state.correlation_threshold_state['threshold_set'] = True
+                    st.session_state.correlation_threshold_state['user_threshold'] = 0.7
+                    st.session_state.correlation_threshold_state['current_step'] = 'column_dropping'
+                    st.rerun()
+            
+            with col2:
+                if st.button("🔧 Set Custom Threshold", key="set_custom_threshold"):
+                    st.session_state.correlation_threshold_state['current_step'] = 'threshold_input'
+                    st.rerun()
+        
+        # Step 2: Threshold input (if custom threshold chosen)
+        elif st.session_state.correlation_threshold_state['current_step'] == 'threshold_input':
+            st.subheader("Step 2: Enter Custom Threshold")
+            st.write("Enter a correlation threshold value between -1 and 1:")
+            
+            user_threshold_str = st.text_input(
+                "Correlation threshold:", 
+                value=str(default_threshold),
+                key="custom_threshold_input"
+            )
+            
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                if st.button("✅ Apply Threshold", key="apply_threshold"):
+                    try:
+                        user_threshold = float(user_threshold_str.strip())
+                        if -1 <= user_threshold <= 1:
+                            st.session_state.correlation_threshold_state['user_threshold'] = user_threshold
+                            st.session_state.correlation_threshold_state['threshold_set'] = True
+                            st.success(f"✅ Threshold set to: {user_threshold}")
+                            st.session_state.correlation_threshold_state['current_step'] = 'column_dropping'
+                            st.rerun()
+                        else:
+                            st.error("❌ Invalid value. Please enter a number between -1 and 1.")
+                    except ValueError:
+                        st.error("❌ Invalid input. Please enter a numerical value.")
+
+                    
+            with col2:
+                if st.button("🔄 Reset to Default", key="reset_threshold"):
+                    st.session_state.correlation_threshold_state['user_threshold'] = default_threshold
+                    st.session_state.correlation_threshold_state['current_step'] = 'threshold_choice'
+                    st.rerun()
+            
+            with col3:
+                if st.button("⬅️ Go Back", key="back_to_choice"):
+                    st.session_state.correlation_threshold_state['current_step'] = 'threshold_choice'
+                    st.rerun()
+
+            
+    
+             
+
+            # Correlations already computed above, just display the results
+            if 'tidy_df' in st.session_state.correlation_threshold_state:
+                st.dataframe(st.session_state.correlation_threshold_state['tidy_df'], use_container_width=True)  
+        # Step 3: Column dropping (if threshold is set)
+        elif st.session_state.correlation_threshold_state['current_step'] == 'column_dropping':
+            # Get the current threshold
+            current_threshold = st.session_state.correlation_threshold_state['user_threshold']
+            
+            st.subheader("Step 3: Handle High Correlations")
+            st.info(f"**Current threshold:** {current_threshold}")
+            
+            # Show high correlation pairs
+            high_corr_pairs = []
+            if 'tidy_df' in st.session_state.correlation_threshold_state:
+                stored_tidy_df = st.session_state.correlation_threshold_state['tidy_df']
+                for _, row in stored_tidy_df.iterrows():
+                    if abs(row['Correlation']) >= current_threshold:
+                        high_corr_pairs.append({
+                            'Column 1': row['Column_1'],
+                            'Column 2': row['Column_2'],
+                            'Correlation': row['Correlation'],
+                            'Interpretation': row['Interpretation']
+                        })
+            else:
+                st.warning("No correlation data available. Please complete the correlation analysis first.")
+                return None, None, None, df, interpretation_messages, metadata_df
+            
+            # Sort the high correlation pairs by correlation value in descending order
+            high_corr_pairs.sort(key=lambda x: x['Correlation'], reverse=True)
+            
+            if high_corr_pairs:
+                st.write(f"**Found {len(high_corr_pairs)} pairs with correlation ≥ {current_threshold}:**")
+                high_corr_df = pd.DataFrame(high_corr_pairs)
+                st.dataframe(high_corr_df, use_container_width=True)
+                
+                st.info("**Recommendation: Consider dropping one column from highly correlated pairs to reduce multicollinearity.**")
+                
+                # Column selection for dropping
+                all_columns = list(set([pair['Column 1'] for pair in high_corr_pairs] + [pair['Column 2'] for pair in high_corr_pairs]))
+                selected_columns_to_drop = st.multiselect(
+                    "Select columns to drop (optional):",
+                    all_columns,
+                    key="columns_to_drop_selection"
+                )
+                
+                if st.button("✅ Apply Column Selection", key="apply_column_selection"):
+                    st.session_state.correlation_threshold_state['columns_to_drop'] = selected_columns_to_drop
+                    if selected_columns_to_drop:
+                        st.success(f"✅ Selected columns to drop: {', '.join(selected_columns_to_drop)}")
+                    else:
+                        st.info("ℹ️ No columns selected for dropping.")
+                    
+                    st.session_state.correlation_threshold_state['current_step'] = 'finalize'
+                    st.rerun()
+            else:
+                st.success("✅ No high correlations found with the current threshold.")
+                st.session_state.correlation_threshold_state['current_step'] = 'finalize'
+                st.rerun()
+        
+        # Step 4: Finalize
+        elif st.session_state.correlation_threshold_state['current_step'] == 'finalize':
+            st.subheader("Step 4: Finalize Configuration")
+            
+            current_threshold = st.session_state.correlation_threshold_state['user_threshold']
+            columns_to_drop = st.session_state.correlation_threshold_state['columns_to_drop']
+            
+            st.write("**Final Configuration:**")
+            st.write(f"• **Threshold:** {current_threshold}")
+            st.write(f"• **Columns to drop:** {', '.join(columns_to_drop) if columns_to_drop else 'None'}")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("✅ Confirm & Proceed", key="confirm_configuration"):
+                    st.session_state.correlation_threshold_state['processed_correlations'] = True
+                    st.success("✅ Configuration confirmed! Processing correlations...")
+                    st.rerun()
+            
+            with col2:
+                if st.button("🔄 Modify Configuration", key="modify_configuration"):
+                    st.session_state.correlation_threshold_state['current_step'] = 'threshold_choice'
+                    st.rerun()
+        
+        # Return current state - function will be called again on next interaction
+        return None, None, None, df, [], metadata_df
+    
+    # If correlations are processed, continue with the original logic
+    else:
+        # Get the final threshold and columns to drop
+        threshold = st.session_state.correlation_threshold_state['user_threshold']
+        columns_to_drop = st.session_state.correlation_threshold_state['columns_to_drop']
+        
+
+        
+        # Show final summary
+        st.success("✅ Correlation analysis completed!")
+        st.write(f"**Final threshold:** {threshold}")
+        if columns_to_drop:
+            st.write(f"**Columns dropped:** {', '.join(columns_to_drop)}")
+            # Drop selected columns from the DataFrame
+            df = df.drop(columns=columns_to_drop, errors='ignore')
+            st.info(f"✅ Updated dataset shape: {df.shape}")
+        
+        # Reset session state for next use
+        st.session_state.correlation_threshold_state = {}
+    
+    # Get the stored tidy_df from session state
+    if 'tidy_df' in st.session_state.correlation_threshold_state:
+        tidy_df = st.session_state.correlation_threshold_state['tidy_df']
+    
+    # Ensure threshold is properly defined
+    if 'threshold' not in locals() or threshold is None:
+        threshold = default_threshold
+    
+    # Debug: Print DataFrame columns for troubleshooting
+    if st.session_state.get('debug_mode', False):
+        st.write(f"Debug: DataFrame columns: {list(tidy_df.columns)}")
+        st.write(f"Debug: Threshold value: {threshold}")
+    
+    threshold_df = tidy_df[(tidy_df['Correlation'] > threshold) | (tidy_df['Correlation'] < -threshold)]
+    #threshold_df = tidy_df[(tidy_df['Correlation'] > 0.7) | (tidy_df['Correlation'] < -0.7)]
+    tidy_df.to_csv(f'{output_folder}/All_correlation_df.csv', index=False)
+    threshold_df.to_csv(f'{output_folder}/threshold_correlation_df.csv', index=False)
+    symmetric_matrix.to_csv(f'{output_folder}/symmetric_correlation_matrix.csv', index=True)
+    interpretation_messages.append(f"<b>Recommendation</b>: Consider dropping columns that are highly correlated to reduce multicollinearity.")
+    
+    if not threshold_df.empty:
+        st.write("\nStrongly correlated feature pairs found:")
+        # Ensure all required columns exist before accessing them
+        required_columns = ['Column_1', 'Column_2', 'Correlation', 'Interpretation']
+        available_columns = [col for col in required_columns if col in threshold_df.columns]
+        
+        if len(available_columns) == len(required_columns):
+            st.write(threshold_df[available_columns])
+        else:
+            st.write(f"Warning: Some columns are missing. Available columns: {list(threshold_df.columns)}")
+            st.write(threshold_df)
+        
+        st.write("**Recommendation:** Consider dropping one column from highly correlated pairs to reduce multicollinearity.")
+        user_choice = st.selectbox("\nDo you want to drop any of these highly correlated columns?", ["no", "yes"], key="corr_drop_choice")
+        if user_choice == 'yes':
+            st.write("\nBased on the pairs above, please enter the column names you want to drop, separated by commas.")
+            st.write("Example: column_A, column_B")
+            cols_to_drop_input = st.text_input("Columns to drop: ", key="corr_cols_to_drop")
+            
+            if cols_to_drop_input and cols_to_drop_input.strip():
+                cols_to_drop = [col.strip() for col in cols_to_drop_input.strip().split(',')]
+                valid_cols_to_drop = [col for col in cols_to_drop if col in df.columns]
+                invalid_cols = [col for col in cols_to_drop if col not in df.columns]
+                
+                if invalid_cols:
+                    st.write(f"\nWarning: The following columns were not found and could not be dropped: {', '.join(invalid_cols)}")
+                
+                if valid_cols_to_drop:
+                    # Create a copy of the DataFrame to avoid modifying the original
+                    df_updated = df.copy()
+                    df_updated = df_updated.drop(columns=valid_cols_to_drop)
+                    
+                    # Update metadata DataFrame
+                    metadata_df_updated = metadata_df[~metadata_df['Column'].isin(valid_cols_to_drop)].copy()
+                    
+                    st.write(f"\nSuccessfully dropped the following columns: {', '.join(valid_cols_to_drop)}")
+                    interpretation_messages.append(f"Actions Taken: Dropped {', '.join(valid_cols_to_drop)} as per user input.")
+                    st.write("The DataFrame has been updated.")
+                    
+                    # Update the return values
+                    df = df_updated
+                    metadata_df = metadata_df_updated
+                else:
+                    st.write("\nNo valid columns were entered to drop.")
+            else:
+                st.write("\nNo columns were entered. No changes made.")
+        else:
+            st.write("\nSkipped dropping highly correlated columns as per user choice.")
+    else:
+        st.write("\nNo highly correlated feature pairs were found.")
+    
+    return tidy_df, threshold_df, symmetric_matrix, df, interpretation_messages, metadata_df
